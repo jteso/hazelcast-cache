@@ -1,0 +1,99 @@
+package com.jteso.poc.hazelcast;
+
+import com.hazelcast.core.*;
+
+import java.util.Random;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.logging.Logger;
+import java.util.concurrent.Executors;
+/**
+ * User: Javi
+ * Date: 4/08/11
+ * Time: 10:56 AM
+ */
+public class Producer {
+    private volatile boolean running = true;
+    private volatile int LOAD = 2000;  //generate 2000 reports per min by default
+    private final int secPerMin = 60;
+    private final BlockingQueue<AuditReport> generatedAuditReports = new LinkedBlockingQueue<AuditReport>(10);
+    Logger logger = Logger.getLogger(this.getClass().getName());
+
+    public Producer(int nThreads){
+        final ExecutorService executors = Executors.newFixedThreadPool(nThreads);
+        final IMap<Long, AuditReport> mapReport = Hazelcast.getMap(Constants.AUDIT__REPORT__MAP);
+        //final IMap<Long,Long> mapInfo = Hazelcast.getMap(Constants.AUDIT__PROCESSED__MAP);
+        final IQueue<Long> queue = Hazelcast.getQueue(Constants.AUDIT__REPORT__QUEUE);
+        for (int i=0; i < nThreads; i++){
+            executors.execute(new Runnable() {
+                public void run() {
+                    while (running){
+                        try {
+                            AuditReport report = generatedAuditReports.take();
+                            Transaction transaction = Hazelcast.getTransaction();
+                            try{
+                                transaction.begin();
+                                mapReport.put(report.getId(), report);
+                                queue.offer(report.getId());
+                                //mapInfo.put(report.getId(), System.currentTimeMillis());
+                                transaction.commit();
+                            }catch (Exception e){
+                                // Oh Lord, this is just a POC, forgive me for catching Exception classes
+                                e.printStackTrace();
+                                transaction.rollback();
+                            }
+                        } catch (InterruptedException e) {
+                             return;
+
+                        }
+
+
+                    }
+                }
+            });
+        }
+
+        listenForCommands();
+        generateFakeAuditRecordsPeriodically();
+        logger.info("Collector started with " + nThreads + " threads.");
+    }
+
+    private void listenForCommands(){
+        Hazelcast.getTopic(Constants.TOPIC_COMMAND).addMessageListener(new MessageListener<Object>() {
+            public void onMessage(Object o) {
+                String str = (String) o;
+                logger.info("Received command:" + str);
+                if (str.startsWith("l")) {
+                    LOAD = Integer.parseInt(str.substring(1));
+                    logger.info("LOAD is set to " + LOAD + " reports per minute. ");
+                }
+
+            }
+        });
+    }
+
+    private void generateFakeAuditRecordsPeriodically(){
+        final Random random = new Random();
+        Timer timer = new Timer();
+        timer.schedule(new TimerTask() {
+            @Override
+            public void run() {
+                // L3000 means 3000 audit records per min ie. 3000/5(nodes) * 60 = 10 reports sec has to be generated
+                int k = LOAD/(Hazelcast.getCluster().getMembers().size()* secPerMin);
+                for (int i=0; i<k; i++){
+                    AuditReport auditReport = AuditReport.generateAMockOfMe();
+                    auditReport.setId(Hazelcast.getIdGenerator("ids").newId());
+                    logger.info("ReportId=" + auditReport.getId() +" created.");
+                    generatedAuditReports.offer(auditReport);
+                }
+            }
+        },0,1000); //run it every sec.
+    }
+
+    public static void main(String args[]){
+        Producer processor = new Producer(Integer.parseInt(args[0]));
+    }
+}
